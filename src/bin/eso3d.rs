@@ -1337,7 +1337,10 @@ fn run() -> Result<(), String> {
                 }
                 let near = list.iter().enumerate().map(|(i, b)| (i, b.near(p))).min_by(|a, b| a.1.0.total_cmp(&b.1.0));
                 if let Some((i, (d, k))) = near && d < cv {
-                    station[i][k] = station[i][k].max(worst);
+                    // the same cells as the away peak: next to a screw or where the wall pushes, the peak is the
+                    // clamping spike (it grows with every finer grid), and growing the bar cannot lower it
+                    let free = an.cases.iter().filter(|k| !k.near[c]).map(|k| k.vm[c]).filter(|v| v.is_finite()).fold(0.0, f64::max);
+                    station[i][k] = station[i][k].max(free);
                 }
             }
             let peak: Vec<f64> = station.iter().map(|v| v.iter().copied().fold(0.0, f64::max)).collect();
