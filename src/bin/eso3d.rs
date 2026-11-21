@@ -9,6 +9,10 @@
 //!                                          across-layer demand x strength / z_mpa (z_mpa: across-layer strength, from the
 //!                                          data sheet; known for the printed library plastics). The bars report also
 //!                                          compares all three orientations (safety factor, bars that need support).
+//!   creep=1 creep_strength=K creep_modulus=M  one more case, "constant": the down force alone (no knock, no side), as it
+//!                                          hangs for years: its stress counts / K (long-term strength = K x short-term)
+//!                                          and its tip sag x 1/M (long-term modulus = M x short-term). Both from the
+//!                                          filament's creep data; there are no defaults (no open data was found)
 //!   loads=split knock=1                    split: two cases, down alone and side alone (+Y); real: down and side together,
 //!                                          the side load both ways (two cases); knock multiplies every force (a margin for knocks)
 //!   back=6 pad=8                           kept solid: wall plate thickness (screws), load pad depth
@@ -984,6 +988,10 @@ fn across_strength(id: &str) -> Option<f64> {
     })
 }
 
+fn creep_line(ks: f64, km: f64) -> String {
+    format!("Creep: the \"constant\" case is the down force alone, as it hangs for years; its stress is shown / {ks} (long-term strength = {ks} x short-term) and its tip sag / {km} (long-term modulus = {km} x short-term); both factors given by hand\n")
+}
+
 const AXES: [&str; 3] = ["x (wall plate on the bed)", "y (on its side)", "z (upright, as mounted)"];
 
 fn print_line(print: Option<usize>, strength: f64, z_mpa: f64) -> String {
@@ -1090,7 +1098,21 @@ fn run() -> Result<(), String> {
 
     let fixed = Region::Side { axis: 0, max: false, depth: 0.5 * h };
     let load = Region::Side { axis: 0, max: true, depth: 0.5 * h };
-    let cases = load_cases(o.get("loads").map_or("split", String::as_str), force, side, num("knock", 1.0)?)?;
+    let mut cases = load_cases(o.get("loads").map_or("split", String::as_str), force, side, num("knock", 1.0)?)?;
+    let creep = o.get("creep").is_some_and(|v| v != "0");
+    // shortcut: no built-in creep data (the open PETG creep papers could not be read, 21 Nov 2026); add defaults per material once sourced
+    let (ks, km) = if creep {
+        let need = |k: &str| if o.contains_key(k) { num(k, 0.0) } else { Err(format!("creep=1 needs {k}= (0-1) from the creep data of {}", m.id)) };
+        (need("creep_strength")?, need("creep_modulus")?)
+    } else {
+        (1.0, 1.0)
+    };
+    if !(ks > 0.0 && ks <= 1.0 && km > 0.0 && km <= 1.0) {
+        return Err("creep_strength and creep_modulus: above 0, at most 1".into());
+    }
+    if creep {
+        cases.push(Case { name: "constant".into(), force: [0.0, 0.0, -force], moment: [0.0; 3] });
+    }
     let print = match o.get("print").map(String::as_str) {
         None | Some("none") => None,
         Some(a) => Some(["x", "y", "z"].iter().position(|v| *v == a).ok_or(format!("print={a}: use x, y or z"))?),
@@ -1103,9 +1125,14 @@ fn run() -> Result<(), String> {
         return Err(format!("z_mpa: the across-layer strength of {} (above 0, at most {strength} MPa); give it from the data sheet", m.id));
     }
     let ratio = strength / z_mpa;
+    // every solve is judged the same way: printed layers, then the constant case on its long-term values
     let layered = |mut an: Analysis, g: &Grid| {
         if let Some(ax) = print {
             an.cases.iter_mut().for_each(|c| c.with_layers(g, ax, ratio));
+        }
+        for c in an.cases.iter_mut().filter(|c| c.name == "constant") {
+            c.vm.iter_mut().for_each(|v| *v /= ks);
+            (c.max_vm, c.max_vm_away, c.p99_vm, c.max_disp) = (c.max_vm / ks, c.max_vm_away / ks, c.p99_vm / ks, c.max_disp / km);
         }
         an
     };
@@ -1121,6 +1148,9 @@ fn run() -> Result<(), String> {
     if let Some(file) = o.get("check") {
         println!("loads at the tip: {}", case_list(&cases));
         println!("{}", print_line(print, strength, z_mpa));
+        if creep {
+            print!("{}", creep_line(ks, km));
+        }
         let (pos, tri) = read_stl(&std::fs::read(file).map_err(|e| format!("{file}: {e}"))?)?;
         let (g, sol, fin) = analyse_mesh(&pos, &tri, &fixed, false)?;
         let cells = sol.iter().filter(|v| **v).count();
@@ -1390,6 +1420,9 @@ fn run() -> Result<(), String> {
         let mut rep = format!("Round bars from {}: {} pillars, each a round bar of its own voxel volume between its ends (fillets {blend} mm); sizing {} to SF {sf}, {round} rounds, kept round {used}{}\n", from.as_deref().unwrap_or("this run"), list.len(), match (two_way, taper) { (true, true) => "both ways, point by point along each bar (tapered)", (true, false) => "both ways (thinner and thicker)", (false, true) => "only thicker, point by point (tapered)", _ => "only thicker" }, if passed { " (the lightest that passes)" } else { " (NONE PASSED: the last one)" });
         rep += &format!("Wall plate: {}, {xb} mm thick; held {}\n", if strip > 0.0 { format!("frame (pads round screws and bar roots, {strip:.1} mm strips)") } else { "full box".into() }, match hold { "wall" => "on the whole wall face", "contact" => "at the screws (the material each screw clamps), and the wall pushes back where the plate presses on it (no friction)", _ => "only at the screws (the material each screw clamps; no wall contact, so on the safe side)" });
         rep += &format!("Loads at the tip: {}\n{}\n", case_list(&cases), print_line(print, strength, z_mpa));
+        if creep {
+            rep += &creep_line(ks, km);
+        }
         for (i, b) in list.iter().enumerate() {
             let (a, z) = (b.pts.first().copied().unwrap_or_default(), b.pts.last().copied().unwrap_or_default());
             rep += &format!("  bar {i:>2}: ({:.0}, {:.0}, {:.0}) -> ({:.0}, {:.0}, {:.0}), {:.0} mm long, pillar {:.2} cm3 -> diameter {:.1} mm; now {:.1} mm at the start, {:.1} at the end, {:.1} thinnest ({:.2} cm3), peak {:.2} MPa (SF {:.1})\n", a[0], a[1], a[2], z[0], z[1], z[2], b.length(), b.vol / 1000.0, 2.0 * r0[i], 2.0 * b.r.first().copied().unwrap_or(0.0), 2.0 * b.r.last().copied().unwrap_or(0.0), 2.0 * b.r.iter().copied().fold(f64::INFINITY, f64::min), b.volume() / 1000.0, peak[i], strength / peak[i].max(1e-12));
