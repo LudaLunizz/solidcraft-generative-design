@@ -4,6 +4,11 @@
 //! eso3d [key=value ...]   (all lengths mm)
 //!   reach=150 base_y=80 base_z=100 tip=20   frustum: wall face x=0, tip face x=reach, tip x tip
 //!   voxel=2.5  force=50 side=15            tip load: force N down (-Z) and side N along Y
+//!   print=x|y|z [z_mpa=30]                 3D printed with the layers stacked along this axis (x: wall plate on the bed,
+//!                                          y: on its side, z: upright): a cell counts the larger of von Mises and the
+//!                                          across-layer demand x strength / z_mpa (z_mpa: across-layer strength, from the
+//!                                          data sheet; known for the printed library plastics). The bars report also
+//!                                          compares all three orientations (safety factor, bars that need support).
 //!   loads=split knock=1                    split: two cases, down alone and side alone (+Y); real: down and side together,
 //!                                          the side load both ways (two cases); knock multiplies every force (a margin for knocks)
 //!   back=6 pad=8                           kept solid: wall plate thickness (screws), load pad depth
@@ -28,7 +33,7 @@
 #![allow(clippy::indexing_slicing, clippy::cast_precision_loss)] // command-line tool: indices come from the grid itself
 
 use generative_design_engine::library::Library;
-use generative_design_engine::stress3d::{Analysis, Case, Contact, Grid, Region, Setup, analyse, heat, png, projection, read_stl, voxelize};
+use generative_design_engine::stress3d::{Analysis, Case, Contact, Grid, Region, Setup, analyse, heat, png, printed_stress, projection, read_stl, voxelize};
 use std::collections::HashMap;
 use std::time::Instant;
 
@@ -965,6 +970,52 @@ fn screw_tension(holes: &[[f64; 2]], half_y: f64, half_z: f64, reach: f64, down:
     t_down.iter().zip(&t_side).map(|(a, b)| [*a, *b]).collect()
 }
 
+/// Across-layer (Z) tensile strength of the printed library plastics, MPa, from the same data sheets as the
+/// library (the library cards hold the in-layer values).
+fn across_strength(id: &str) -> Option<f64> {
+    Some(match id {
+        "pla-printed" => 38.0,
+        "petg-printed" => 30.0,
+        "abs-printed" => 32.0,
+        "asa-printed" => 31.0,
+        "paht-cf-printed" => 47.0,
+        "pa12-sls" => 42.0,
+        _ => return None,
+    })
+}
+
+const AXES: [&str; 3] = ["x (wall plate on the bed)", "y (on its side)", "z (upright, as mounted)"];
+
+fn print_line(print: Option<usize>, strength: f64, z_mpa: f64) -> String {
+    match print {
+        Some(a) => format!("Printed: layers stacked along {}; {strength} MPa along the layers, {z_mpa} MPa across them (the stress shown and sized is the larger of von Mises and the across-layer demand x {:.2})", AXES[a], strength / z_mpa),
+        None => "Material taken as equally strong in every direction (print= not set)".into(),
+    }
+}
+
+/// Bar length (mm) that overhangs by more than 45 degrees when the layers stack along `axis`: the parts of the
+/// bar that run within 45 degrees of the bed need support (or bridge).
+fn overhang_mm(bar: &Bar, axis: usize) -> f64 {
+    bar.pts.windows(2).map(|w| {
+        let d = sub(w[1], w[0]);
+        let l = dot(d, d).sqrt();
+        if l > 0.0 && d[axis].abs() < l * std::f64::consts::FRAC_1_SQRT_2 { l } else { 0.0 }
+    }).sum()
+}
+
+/// One solve serves every print direction (the material model is the same in all directions): the safety
+/// factor if the layers stacked along x, y or z, and the bars that would need support.
+fn orientations(an: &Analysis, bars: &[Bar], strength: f64, ratio: f64, chosen: Option<usize>) -> String {
+    let mut t = String::from("Print orientation (same design, same solve; peak away from load and supports):\n");
+    for (axis, name) in AXES.iter().enumerate() {
+        let peak = an.cases.iter().flat_map(|c| c.stress.iter().zip(&c.near).filter(|(st, near)| st[0].is_finite() && !**near).map(|(st, _)| printed_stress(st, axis, ratio))).fold(0.0, f64::max);
+        let over: Vec<(usize, f64)> = bars.iter().enumerate().map(|(i, b)| (i, overhang_mm(b, axis))).filter(|(_, l)| *l > 1.0).collect();
+        let list = over.iter().map(|(i, l)| format!("{i} ({l:.0} mm)")).collect::<Vec<_>>().join(", ");
+        t += &format!("  layers along {name}: peak {peak:.2} MPa, SF {:.1}; {} of {} bars need support{}{}\n", strength / peak.max(1e-12), over.len(), bars.len(), if list.is_empty() { String::new() } else { format!(": {list}") }, if chosen == Some(axis) { "  <- this run" } else { "" });
+    }
+    t
+}
+
 /// The tip load cases. split: down alone and side alone (+Y), as runs 1-10. real: down and side together, the
 /// side load both ways; down alone is left out because (linear) von Mises of a+b or of a-b is never below that
 /// of a. knock scales every force.
@@ -1040,17 +1091,36 @@ fn run() -> Result<(), String> {
     let fixed = Region::Side { axis: 0, max: false, depth: 0.5 * h };
     let load = Region::Side { axis: 0, max: true, depth: 0.5 * h };
     let cases = load_cases(o.get("loads").map_or("split", String::as_str), force, side, num("knock", 1.0)?)?;
+    let print = match o.get("print").map(String::as_str) {
+        None | Some("none") => None,
+        Some(a) => Some(["x", "y", "z"].iter().position(|v| *v == a).ok_or(format!("print={a}: use x, y or z"))?),
+    };
+    let z_mpa = match o.get("z_mpa") {
+        Some(_) => num("z_mpa", 0.0)?,
+        None => across_strength(&m.id).unwrap_or(f64::NAN),
+    };
+    if (print.is_some() || o.contains_key("z_mpa")) && !(z_mpa > 0.0 && z_mpa <= strength) {
+        return Err(format!("z_mpa: the across-layer strength of {} (above 0, at most {strength} MPa); give it from the data sheet", m.id));
+    }
+    let ratio = strength / z_mpa;
+    let layered = |mut an: Analysis, g: &Grid| {
+        if let Some(ax) = print {
+            an.cases.iter_mut().for_each(|c| c.with_layers(g, ax, ratio));
+        }
+        an
+    };
     let cv = num("check_voxel", 1.25)?;
     let wall_face = Region::Side { axis: 0, max: false, depth: 0.5 * cv };
     // wall = the wall face pushes back where the plate presses on it (lifts off where it pulls away)
     let analyse_mesh = |pos: &[[f64; 3]], tri: &[[u32; 3]], fixed: &Region, wall: bool| -> Result<(Grid, Vec<bool>, Analysis), String> {
         let (g, sol) = voxelize(pos, tri, cv)?;
         let setup = Setup { grid: &g, solid: &sol, e_mpa: e_gpa * 1000.0, nu, fixed, load: &Region::Side { axis: 0, max: true, depth: 0.5 * cv }, cg_tol: 1e-8, cg_max: 50_000, exclude_layers: 2, cell_scale: None, multigrid: true, contact: wall.then_some(Contact { region: &wall_face, axis: 0, push: 1.0 }) };
-        let an = analyse(&setup, &cases, |m| if m.contains("wall contact") { eprintln!("  {m}") })?;
+        let an = layered(analyse(&setup, &cases, |m| if m.contains("wall contact") { eprintln!("  {m}") })?, &g);
         Ok((g, sol, an))
     };
     if let Some(file) = o.get("check") {
         println!("loads at the tip: {}", case_list(&cases));
+        println!("{}", print_line(print, strength, z_mpa));
         let (pos, tri) = read_stl(&std::fs::read(file).map_err(|e| format!("{file}: {e}"))?)?;
         let (g, sol, fin) = analyse_mesh(&pos, &tri, &fixed, false)?;
         let cells = sol.iter().filter(|v| **v).count();
@@ -1111,7 +1181,7 @@ fn run() -> Result<(), String> {
         "smoothing only".to_string()
     } else { loop {
         let setup = Setup { grid: &grid, solid: &solid, e_mpa: e_gpa * 1000.0, nu, fixed: &fixed, load: &load, cg_tol: 1e-6, cg_max: 20_000, exclude_layers: 2, cell_scale: None, multigrid: true, contact: None };
-        let r = analyse(&setup, &cases, |_| {})?;
+        let r = layered(analyse(&setup, &cases, |_| {})?, &grid);
         let away = r.cases.iter().map(|c| c.max_vm_away).fold(0.0, f64::max);
         let count = r.cases[0].vm.iter().filter(|v| !v.is_nan()).count();
         let found = if away > 0.0 { strength / away } else { f64::INFINITY };
@@ -1267,7 +1337,10 @@ fn run() -> Result<(), String> {
                 }
                 let near = list.iter().enumerate().map(|(i, b)| (i, b.near(p))).min_by(|a, b| a.1.0.total_cmp(&b.1.0));
                 if let Some((i, (d, k))) = near && d < cv {
-                    station[i][k] = station[i][k].max(worst);
+                    // the same cells as the away peak: next to a screw or where the wall pushes, the peak is the
+                    // clamping spike (it grows with every finer grid), and growing the bar cannot lower it
+                    let free = an.cases.iter().filter(|k| !k.near[c]).map(|k| k.vm[c]).filter(|v| v.is_finite()).fold(0.0, f64::max);
+                    station[i][k] = station[i][k].max(free);
                 }
             }
             let peak: Vec<f64> = station.iter().map(|v| v.iter().copied().fold(0.0, f64::max)).collect();
@@ -1316,7 +1389,7 @@ fn run() -> Result<(), String> {
         let v = volume(&tris);
         let mut rep = format!("Round bars from {}: {} pillars, each a round bar of its own voxel volume between its ends (fillets {blend} mm); sizing {} to SF {sf}, {round} rounds, kept round {used}{}\n", from.as_deref().unwrap_or("this run"), list.len(), match (two_way, taper) { (true, true) => "both ways, point by point along each bar (tapered)", (true, false) => "both ways (thinner and thicker)", (false, true) => "only thicker, point by point (tapered)", _ => "only thicker" }, if passed { " (the lightest that passes)" } else { " (NONE PASSED: the last one)" });
         rep += &format!("Wall plate: {}, {xb} mm thick; held {}\n", if strip > 0.0 { format!("frame (pads round screws and bar roots, {strip:.1} mm strips)") } else { "full box".into() }, match hold { "wall" => "on the whole wall face", "contact" => "at the screws (the material each screw clamps), and the wall pushes back where the plate presses on it (no friction)", _ => "only at the screws (the material each screw clamps; no wall contact, so on the safe side)" });
-        rep += &format!("Loads at the tip: {}\n", case_list(&cases));
+        rep += &format!("Loads at the tip: {}\n{}\n", case_list(&cases), print_line(print, strength, z_mpa));
         for (i, b) in list.iter().enumerate() {
             let (a, z) = (b.pts.first().copied().unwrap_or_default(), b.pts.last().copied().unwrap_or_default());
             rep += &format!("  bar {i:>2}: ({:.0}, {:.0}, {:.0}) -> ({:.0}, {:.0}, {:.0}), {:.0} mm long, pillar {:.2} cm3 -> diameter {:.1} mm; now {:.1} mm at the start, {:.1} at the end, {:.1} thinnest ({:.2} cm3), peak {:.2} MPa (SF {:.1})\n", a[0], a[1], a[2], z[0], z[1], z[2], b.length(), b.vol / 1000.0, 2.0 * r0[i], 2.0 * b.r.first().copied().unwrap_or(0.0), 2.0 * b.r.last().copied().unwrap_or(0.0), 2.0 * b.r.iter().copied().fold(f64::INFINITY, f64::min), b.volume() / 1000.0, peak[i], strength / peak[i].max(1e-12));
@@ -1327,6 +1400,9 @@ fn run() -> Result<(), String> {
         }
         rep += "  (a bar's peak counts only material outside the plate and the tip pad; the away peak also counts inside them)\n";
         rep += &format!("bars.stl: {} triangles, {:.1} cm3 = {:.1} g (voxel design {:.1} cm3; arms {:.1} cm3, of which {:.2} in no pillar)\n", tris.len(), v / 1000.0, v / 1000.0 * m.strengths().density_kg_m3.unwrap_or(1270.0) / 1000.0, count as f64 * cell_cm3, arms / 1000.0, lost / 1000.0);
+        if z_mpa.is_finite() {
+            rep += &orientations(&an, &list, strength, ratio, print);
+        }
         rep += &stress_pictures(&out, &pos, &tri, &g, &an)?;
         std::fs::write(format!("{out}/bars-report.txt"), &rep).map_err(|e| e.to_string())?;
         print!("{rep}");
@@ -1337,7 +1413,7 @@ fn run() -> Result<(), String> {
     }
     // final analysis of exactly what was written
     let setup = Setup { grid: &grid, solid: &solid, e_mpa: e_gpa * 1000.0, nu, fixed: &fixed, load: &load, cg_tol: 1e-8, cg_max: 50_000, exclude_layers: 2, cell_scale: None, multigrid: true, contact: None };
-    let fin = analyse(&setup, &cases, |_| {})?;
+    let fin = layered(analyse(&setup, &cases, |_| {})?, &grid);
     let mut rep = String::new();
     for c in &fin.cases {
         for (ax, name) in [(0, "x"), (1, "y"), (2, "z")] {
@@ -1504,6 +1580,17 @@ mod tests {
         assert!(edges.iter().all(|(a, b)| edges.contains(&(*b, *a))), "the mesh has an open edge");
         let tiny = tris.iter().filter(|t| { let c = cross(sub(t[1], t[0]), sub(t[2], t[0])); dot(c, c).sqrt() / 2.0 < 1e-4 }).count();
         assert_eq!(tiny, 0, "slivers");
+    }
+
+    #[test]
+    fn overhang_counts_the_flat_parts_only() {
+        let bar = |pts: Vec<[f64; 3]>| Bar { r: vec![2.5; pts.len()], pts, vol: 0.0 };
+        let flat_then_steep = bar(vec![[0.0, 0.0, 0.0], [10.0, 0.0, 0.0], [10.0, 0.0, 20.0]]);
+        assert!((overhang_mm(&flat_then_steep, 2) - 10.0).abs() < 1e-9, "upright: the flat 10 mm need support");
+        assert!((overhang_mm(&flat_then_steep, 0) - 20.0).abs() < 1e-9, "on the plate: now the 20 mm run is flat");
+        assert!(overhang_mm(&bar(vec![[0.0; 3], [10.0, 0.0, 11.0]]), 2) == 0.0, "steeper than 45 degrees prints");
+        assert_eq!(across_strength("petg-printed"), Some(30.0));
+        assert_eq!(across_strength("steel-s235jr"), None);
     }
 
     #[test]

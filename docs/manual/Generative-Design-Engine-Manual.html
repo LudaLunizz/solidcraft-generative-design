@@ -194,6 +194,7 @@ solidcraft-cli run refine.json        # or ask Claude: MCP batch {"path": ...}</
   force=50 side=15 material=petg-printed sf=4 holes=20:30,-20:30 out=run1</pre>
 <p>Writes the voxel STL and a smooth STL. Holes default to Ø4.5 with a Ø8.4, 90° countersink (<code>hole=</code>, <code>sink=</code>).</p>
 <p>Loads: by default two cases, <code>force</code> down alone and <code>side</code> sideways alone (one way). <code>loads=real</code> puts them together and checks the side load both ways; <code>knock=1.5</code> (1 to 10) multiplies every force as a margin for knocks. Set <code>force</code> to what really hangs on the bracket (N = kg × 9.81).</p>
+<p>Printed parts: <code>print=x</code>, <code>y</code> or <code>z</code> tells it which way the layers stack (x: wall plate on the bed, y: on its side, z: upright). A print is weaker across its layers (PETG 30 MPa against 47 along them), so every spot is judged by whichever is worse: the normal stress, or what pulls the layers apart, scaled up by 47/30. The strength across the layers is known for the printed library plastics; for others give it with <code>z_mpa=</code>. The bars report also lists all three orientations from the same run: the safety factor for each and the bars that would need support (flatter than 45°).</p>
 <h3>beam_opt</h3>
 <pre>target/release/beam_opt length=5000 depth=400 elem=10 load=98.1 gpu=1 jobs=10 --out beam/</pre>
 <p>A starting point only: for long beams the weight is set by buckling, and a tube often wins (it did for the 5 m beam).</p>

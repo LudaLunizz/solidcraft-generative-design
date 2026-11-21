@@ -341,6 +341,56 @@ pub struct CaseResult {
     pub near: Vec<bool>,
 }
 
+/// Von Mises stress of (sx, sy, sz, txy, tyz, tzx).
+pub fn von_mises(st: &[f64; 6]) -> f64 {
+    let [sx, sy, sz, txy, tyz, tzx] = *st;
+    (0.5 * ((sx - sy).powi(2) + (sy - sz).powi(2) + (sz - sx).powi(2)) + 3.0 * (txy * txy + tyz * tyz + tzx * tzx)).sqrt()
+}
+
+/// What pulls a printed part's layers apart when they stack along `axis` (0 x, 1 y, 2 z): the tension across
+/// the layers and the two shears on the layer plane, combined (as in stress3d_printed). Pressure counts nothing.
+pub fn across_layers(st: &[f64; 6], axis: usize) -> f64 {
+    let [sx, sy, sz, txy, tyz, tzx] = *st;
+    let (n, a, b) = match axis {
+        0 => (sx, txy, tzx),
+        1 => (sy, txy, tyz),
+        _ => (sz, tyz, tzx),
+    };
+    (n.max(0.0).powi(2) + a * a + b * b).sqrt()
+}
+
+/// The stress a printed cell is judged by, against the in-layer strength: von Mises, or the across-layer demand
+/// scaled up by in-layer / across-layer strength (`ratio`), whichever is larger.
+pub fn printed_stress(st: &[f64; 6], axis: usize, ratio: f64) -> f64 {
+    von_mises(st).max(across_layers(st, axis) * ratio)
+}
+
+impl CaseResult {
+    /// A printed part, layers stacked along `axis`: every cell's `vm` becomes [`printed_stress`], and the
+    /// peaks (all, away from load and supports, 99th percentile) are taken again. Stresses are unchanged.
+    pub fn with_layers(&mut self, grid: &Grid, axis: usize, ratio: f64) {
+        for (v, st) in self.vm.iter_mut().zip(&self.stress) {
+            if v.is_finite() {
+                *v = printed_stress(st, axis, ratio);
+            }
+        }
+        let (mut max, mut max_c, mut away, mut away_c) = (0.0, 0, 0.0, 0);
+        let mut sorted = Vec::new();
+        for (c, v) in self.vm.iter().enumerate().filter(|(_, v)| v.is_finite()) {
+            sorted.push(*v);
+            if *v > max {
+                (max, max_c) = (*v, c);
+            }
+            if *v > away && !self.near.get(c).copied().unwrap_or(true) {
+                (away, away_c) = (*v, c);
+            }
+        }
+        sorted.sort_by(f64::total_cmp);
+        self.p99_vm = sorted.get(((sorted.len() as f64 * 0.99) as usize).min(sorted.len().saturating_sub(1))).copied().unwrap_or(0.0);
+        (self.max_vm, self.max_vm_at, self.max_vm_away, self.max_vm_away_at) = (max, grid.cell_centre(max_c), away, grid.cell_centre(away_c));
+    }
+}
+
 pub struct Analysis {
     pub cells_material: usize,
     pub cells_dropped: usize,
@@ -1100,6 +1150,29 @@ mod tests {
         let tip = 10.0 * 1e6 / (3.0 * 1000.0 * i) + 10.0 * 100.0 / (5.0 / 6.0 * g * 100.0);
         assert!((0.9..=1.02).contains(&(r.max_disp / tip)), "tip {} vs {tip}", r.max_disp);
         assert!((0.8..=1.1).contains(&(r.p99_vm / 6.0)), "p99 {}", r.p99_vm);
+    }
+
+    /// A rod pulled along x at 1 MPa: printed with the layers stacked along x the pull goes straight across
+    /// them (judged at 1 MPa × ratio); stacked along y it runs along the layers (plain von Mises).
+    #[test]
+    fn layers_across_the_pull_count_by_the_ratio() {
+        assert!((across_layers(&[2.0, -5.0, 0.0, 0.0, 0.0, 0.0], 0) - 2.0).abs() < 1e-12 && across_layers(&[-2.0, 0.0, 0.0, 0.0, 0.0, 0.0], 0) == 0.0, "pressure counts nothing");
+        assert!((across_layers(&[0.0, 0.0, 0.0, 3.0, 0.0, 4.0], 0) - 5.0).abs() < 1e-12 && across_layers(&[0.0, 0.0, 0.0, 3.0, 0.0, 4.0], 1) == 3.0);
+        let (p, t) = box_stl([0.0, 0.0, 0.0], [40.0, 10.0, 10.0]);
+        let (grid, solid) = voxelize(&p, &t, 1.0).unwrap();
+        let fixed = Region::Side { axis: 0, max: false, depth: 0.01 };
+        let load = Region::Side { axis: 0, max: true, depth: 0.01 };
+        let setup = Setup { grid: &grid, solid: &solid, e_mpa: 1000.0, nu: 0.3, fixed: &fixed, load: &load, cg_tol: 1e-9, cg_max: 20_000, exclude_layers: 4, cell_scale: None, multigrid: true, contact: None };
+        let a = analyse(&setup, &[Case { name: "pull".into(), force: [100.0, 0.0, 0.0], moment: [0.0; 3] }], |_| {}).unwrap();
+        let mut across = a.cases.into_iter().next().unwrap();
+        let mut along = CaseResult { vm: across.vm.clone(), near: across.near.clone(), stress: across.stress.clone(), name: "along".into(), ..across };
+        let ratio = 47.0 / 30.0;
+        across.with_layers(&grid, 0, ratio);
+        along.with_layers(&grid, 1, ratio);
+        let mid = grid.cell_index(20, 5, 5); // away from the clamped and the loaded end
+        assert!((across.vm[mid] / ratio - 1.0).abs() < 0.05, "across {}", across.vm[mid]);
+        assert!((along.vm[mid] - 1.0).abs() < 0.05, "along {}", along.vm[mid]);
+        assert!(across.max_vm_away > along.max_vm_away * 1.4);
     }
 
     /// Multigrid and plain Jacobi give the same answer, multigrid in a fraction of the steps.
